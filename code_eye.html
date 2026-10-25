@@ -1,0 +1,352 @@
+<title>Code Eye</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Major+Mono+Display&display=swap">
+<style>
+  /* Layout: one full-bleed canvas of glyphs; a thin HUD pinned to the top and bottom edges, clear of the safe areas.
+     Deliberately single-theme (a dark screen), so every color is set explicitly. */
+  :root {
+    --bg: #06070b;
+    --ink: #ece6d6;
+    --dim: #6a7387;
+    --amber: #ffb547;
+    --teal: #2fd3c4;
+    --f-display: "Major Mono Display", "JetBrains Mono", ui-monospace, monospace;
+    --f-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); }
+  body { margin: 0; font-family: var(--f-mono); }
+  canvas {
+    position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    touch-action: none; cursor: crosshair; outline: none;
+  }
+  canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--teal); }
+  .hud {
+    position: fixed; left: 0; right: 0; z-index: 1;
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 6px 16px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    pointer-events: none;
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim);
+  }
+  .hud.top { top: 0; padding-top: calc(env(safe-area-inset-top, 0px) + 14px); }
+  .hud.bottom { bottom: 0; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); }
+  h1 {
+    margin: 0; font-family: var(--f-display); font-weight: 400; font-size: 20px;
+    letter-spacing: 0.04em; text-transform: lowercase; color: var(--ink);
+  }
+  .readout { font-variant-numeric: tabular-nums; }
+  .readout b { color: var(--amber); font-weight: 600; }
+  .hint { color: var(--teal); }
+</style>
+
+<canvas id="eye" tabindex="0" aria-label="An eye drawn entirely from moving numbers and code characters. It looks around and blinks; drag to steer its gaze, tap or press Space to make it blink."></canvas>
+
+<header class="hud top">
+  <h1>code eye</h1>
+  <span>iris · 0x0–0xF</span>
+</header>
+<footer class="hud bottom">
+  <span class="readout" id="readout">gaze <b>+0.00</b> <b>+0.00</b></span>
+  <span class="hint">Drag to look · tap to blink</span>
+</footer>
+
+<script>
+(() => {
+  const canvas = document.getElementById('eye');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const readout = document.getElementById('readout');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // The white of the eye is written in this script's own source code.
+  const SRC = ((document.currentScript && document.currentScript.textContent) || 'const eye = look(around);')
+    .replace(/\s+/g, ' ').trim();
+
+  const DIGITS = '0123456789';
+  const HEX = '0123456789ABCDEF';
+  const LID_UP = '=#=+';
+  const LID_LO = '-~-.';
+  const BG = '#06070b';
+
+  const rgb = c => `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+  const mix = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+  const AMBER = [255, 181, 71], TEAL = [47, 211, 196], BLUE = [42, 95, 168];
+  const IVORY = rgb([236, 230, 214]), ROSE = rgb([232, 132, 128]), SLATE = rgb([106, 128, 170]), WHITE = '#ffffff';
+  // Iris colour by radius: amber at the pupil, teal in the middle, deep blue at the rim.
+  const IRIS = Array.from({ length: 32 }, (_, i) => {
+    const k = i / 31;
+    return rgb(k < 0.55 ? mix(AMBER, TEAL, k / 0.55) : mix(TEAL, BLUE, (k - 0.55) / 0.45));
+  });
+
+  let W = 0, H = 0, dpr = 1, fs = 12, cw = 7, ch = 13, cols = 0, rows = 0;
+  let seed, rate, drops, uu, up, lo, cr, tolU, tolL, inEye;
+
+  const gaze = { x: 0, y: 0, tx: 0, ty: 0 };
+  let pupilKick = 0;
+  let open = 1, blinkStart = -1, nextBlink = 2.2, blinks = 0;
+  let nextSaccade = 0.8, pointerUntil = -1;
+  let t = 0, last = performance.now(), nextReadout = 0, glyphs = 0;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    fs = Math.max(9, Math.min(16, Math.min(W, H) / 44));
+    ctx.font = `500 ${fs}px "JetBrains Mono", ui-monospace, Menlo, monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    cw = ctx.measureText('0').width || fs * 0.6;
+    ch = fs * 1.08;
+    cols = Math.ceil(W / cw) + 1;
+    rows = Math.ceil(H / ch) + 1;
+
+    const n = cols * rows;
+    seed = new Float32Array(n);
+    rate = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      seed[i] = Math.random();
+      rate[i] = reduce ? 0.4 + Math.random() * 1.2 : 2 + Math.random() * 12;
+    }
+    drops = Array.from({ length: cols }, () => newDrop(true));
+    uu = new Float32Array(cols); up = new Float32Array(cols); lo = new Float32Array(cols);
+    cr = new Float32Array(cols); tolU = new Float32Array(cols); tolL = new Float32Array(cols);
+    inEye = new Uint8Array(cols);
+  }
+
+  function newDrop(scatter) {
+    return {
+      y: scatter ? Math.random() * rows : -Math.random() * rows * 0.4,
+      speed: (reduce ? 2 : 6) + Math.random() * (reduce ? 4 : 16),
+      len: 6 + Math.random() * 20
+    };
+  }
+
+  function startBlink() {
+    if (blinkStart >= 0) return;
+    blinkStart = t;
+    blinks++;
+  }
+
+  function update(dt) {
+    // Wander with quick saccades unless a finger or mouse is steering.
+    if (t > pointerUntil && t > nextSaccade) {
+      const far = Math.random() < 0.3;
+      gaze.tx = far ? Math.random() * 2 - 1 : gaze.tx * 0.3 + (Math.random() * 2 - 1) * 0.45;
+      gaze.ty = (Math.random() * 2 - 1) * (far ? 0.8 : 0.4);
+      if (Math.random() < 0.2) gaze.tx = gaze.ty = 0;
+      nextSaccade = t + (reduce ? 2.5 : 0.5) + Math.random() * 2.2;
+    }
+    const k = Math.min(1, dt * (reduce ? 3 : 18));
+    gaze.x += (gaze.tx - gaze.x) * k;
+    gaze.y += (gaze.ty - gaze.y) * k;
+
+    if (blinkStart < 0 && t > nextBlink) startBlink();
+    if (blinkStart >= 0) {
+      const p = t - blinkStart;
+      if (p < 0.09) open = 1 - p / 0.09;
+      else if (p < 0.13) open = 0;
+      else if (p < 0.3) { const q = (p - 0.13) / 0.17; open = q * (2 - q); }
+      else {
+        open = 1; blinkStart = -1;
+        nextBlink = t + (Math.random() < 0.15 ? 0.25 : 2.5 + Math.random() * 4);
+      }
+    }
+    pupilKick = Math.max(0, pupilKick - dt * 1.2);
+
+    for (const d of drops) {
+      d.y += d.speed * dt;
+      if (d.y - d.len > rows) Object.assign(d, newDrop(false));
+    }
+  }
+
+  function draw() {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2, cy = H / 2;
+    const EW = Math.min(W * 0.47, H * 0.62);
+    const EH = EW * 0.5;
+    const R = EH * 0.9;
+    const pupil = (0.36 + 0.05 * Math.sin(t * 0.6)) * (1 - 0.4 * pupilKick);
+    const pr = R * pupil;
+    const ix = cx + gaze.x * EW * 0.42, iy = cy + gaze.y * EH * 0.45;
+    const hx = ix - R * 0.32, hy = iy - R * 0.36, hr = R * 0.16;
+    const shift = (1 - open) * EH * 0.18;
+    const lashGap = cw * 2.2;
+    const step = (t * (reduce ? 1 : 5)) | 0;
+    const lidStep = (t * (reduce ? 1 : 6)) | 0;
+
+    // Lid, crease and lash geometry depends only on the column.
+    for (let c = 0; c < cols; c++) {
+      const u = (c * cw + cw * 0.5 - cx) / EW;
+      uu[c] = u;
+      inEye[c] = Math.abs(u) < 1 ? 1 : 0;
+      if (!inEye[c]) continue;
+      const base = 1 - u * u;
+      up[c] = -EH * Math.pow(base, 0.85) * open * (1 - 0.1 * u) + shift * base;
+      lo[c] = EH * 0.8 * Math.pow(base, 1.15) * open + shift * base;
+      cr[c] = -EH * 1.45 * Math.pow(base, 0.7);
+    }
+    for (let c = 0; c < cols; c++) {
+      if (!inEye[c]) continue;
+      const a = inEye[c - 1] ? c - 1 : c, b = inEye[c + 1] ? c + 1 : c;
+      tolU[c] = ch * 0.55 + Math.abs(up[b] - up[a]) * 0.5;
+      tolL[c] = ch * 0.55 + Math.abs(lo[b] - lo[a]) * 0.5;
+    }
+
+    // A soft glow behind the iris.
+    const glow = ctx.createRadialGradient(ix, iy, pr * 0.5, ix, iy, R * 1.7);
+    glow.addColorStop(0, `rgba(47,211,196,${0.12 * open})`);
+    glow.addColorStop(1, 'rgba(47,211,196,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(ix - R * 1.7, iy - R * 1.7, R * 3.4, R * 3.4);
+
+    let style = '';
+    glyphs = 0;
+    for (let r = 0; r < rows; r++) {
+      const y = r * ch + ch * 0.5, dy = y - cy;
+      for (let c = 0; c < cols; c++) {
+        const i = r * cols + c, x = c * cw + cw * 0.5, dx = x - cx;
+        const s = seed[i], u = uu[c];
+        let g, col, a;
+
+        if (inEye[c] && Math.abs(dy - up[c]) < tolU[c]) {
+          // Upper lid edge: a marquee of '=' and '#'.
+          g = LID_UP[(c + lidStep) & 3];
+          col = IVORY; a = 0.55 + 0.4 * (1 - u * u);
+        } else if (inEye[c] && open > 0.05 && Math.abs(dy - lo[c]) < tolL[c]) {
+          g = LID_LO[(c - lidStep) & 3];
+          col = IVORY; a = 0.3 + 0.3 * (1 - u * u);
+        } else if (inEye[c] && dy > up[c] && dy < lo[c]) {
+          const lidShade = Math.min(1, (dy - up[c]) / (EH * 0.35));
+          const ddx = x - ix, ddy = y - iy, d = Math.sqrt(ddx * ddx + ddy * ddy);
+          const hd = Math.hypot(x - hx, y - hy);
+          if (hd < hr) {
+            g = s < 0.5 ? '@' : '#'; col = WHITE; a = 0.95 - 0.4 * hd / hr;
+          } else if (d < pr) {
+            if (s < 0.82) continue;
+            g = '01'[((s * 97 + t * rate[i]) | 0) & 1]; col = SLATE; a = 0.13;
+          } else if (d < R) {
+            const rr = (d - pr) / (R - pr);
+            const ang = Math.atan2(ddy, ddx) + t * 0.12;
+            const fib = 0.5 + 0.5 * Math.sin(ang * 23 + Math.sin(ang * 5) * 1.6);
+            const wave = 0.5 + 0.5 * Math.sin(rr * 10 - t * 2.6);
+            let b = 0.28 + 0.45 * fib + 0.27 * wave;
+            if (rr < 0.12) b = Math.max(b, 0.95 - rr * 3);
+            if (rr > 0.82) b *= 1 - (rr - 0.82) / 0.18 * 0.55;
+            g = HEX[((s * 160 + t * rate[i]) | 0) & 15];
+            col = IRIS[Math.min(31, (rr * 31) | 0)];
+            a = b * (0.35 + 0.65 * lidShade);
+          } else {
+            // Sclera: this program's source, scrolling left row by row.
+            g = SRC[(r * 131 + c + step) % SRC.length];
+            if (g === ' ') continue;
+            col = u < -0.8 ? ROSE : IVORY;
+            a = (0.14 + 0.46 * (1 - u * u)) * (0.3 + 0.7 * lidShade);
+          }
+        } else {
+          const above = inEye[c] ? up[c] - dy : -1;
+          const lashLen = EH * 0.38 * Math.sqrt(Math.max(0, 1 - (u * u) / 0.85)) * (0.4 + 0.6 * open);
+          let lash = false;
+          if (above > tolU[c] && above < lashLen) {
+            const m = (dx - u * above * 0.9) / lashGap;
+            lash = Math.abs(m - Math.round(m)) * lashGap < cw * 0.55;
+          }
+          if (lash) {
+            g = u < -0.15 ? '\\' : u > 0.15 ? '/' : '|';
+            col = IVORY; a = 0.5 * (1 - above / lashLen) + 0.15;
+          } else if (inEye[c] && Math.abs(u) < 0.9 && Math.abs(dy - cr[c]) < ch * 0.5) {
+            g = (c + lidStep) % 3 ? '-' : '~';
+            col = SLATE; a = 0.32 * (1 - (u * u) / 0.81);
+          } else {
+            // Background: falling columns of digits, dimmed around the eye.
+            const drop = drops[c], dist = drop.y - r;
+            if (dist >= 0 && dist < drop.len) {
+              const b = 1 - dist / drop.len;
+              a = dist < 1 ? 0.6 : 0.05 + 0.32 * b * b;
+            } else {
+              if (s > 0.5) continue;
+              a = 0.05;
+            }
+            const vy = dy / (EH * 1.8);
+            a *= Math.min(1, Math.max(0.12, u * u + vy * vy - 0.35));
+            g = DIGITS[((s * 977 + t * rate[i] * 0.5) | 0) % 10];
+            col = SLATE;
+          }
+        }
+
+        if (col !== style) { ctx.fillStyle = col; style = col; }
+        ctx.globalAlpha = a;
+        ctx.fillText(g, x, y);
+        glyphs++;
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  const sign = v => (v < 0 ? '−' : '+') + Math.abs(v).toFixed(2);
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    t += dt;
+    update(dt);
+    draw();
+    if (t > nextReadout) {
+      const pupil = (0.36 + 0.05 * Math.sin(t * 0.6)) * (1 - 0.4 * pupilKick);
+      readout.innerHTML =
+        `gaze <b>${sign(gaze.x)}</b> <b>${sign(-gaze.y)}</b> · pupil <b>${Math.round(pupil * 100)}%</b>` +
+        ` · blinks <b>${blinks}</b> · <b>${glyphs.toLocaleString()}</b> glyphs`;
+      nextReadout = t + 0.2;
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Pointer: drag (or hover with a mouse) steers the gaze; a quick tap blinks.
+  let down = null;
+  function aim(e) {
+    if (e.pointerType !== 'mouse' && !down) return;
+    const EW = Math.min(W * 0.47, H * 0.62), EH = EW * 0.5;
+    let x = (e.clientX - W / 2) / EW, y = (e.clientY - H / 2) / (EH * 1.6);
+    const m = Math.hypot(x, y);
+    if (m > 1) { x /= m; y /= m; }
+    gaze.tx = x; gaze.ty = y;
+    pointerUntil = t + 2.5;
+  }
+  canvas.addEventListener('pointerdown', e => {
+    down = { x: e.clientX, y: e.clientY, at: performance.now() };
+    canvas.setPointerCapture?.(e.pointerId);
+    aim(e);
+  });
+  canvas.addEventListener('pointermove', aim);
+  canvas.addEventListener('pointerup', e => {
+    if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 12 && performance.now() - down.at < 350) {
+      startBlink();
+      pupilKick = 1;
+    }
+    down = null;
+  });
+  canvas.addEventListener('pointercancel', () => { down = null; });
+  canvas.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); startBlink(); pupilKick = 1; }
+  });
+
+  let pending = false;
+  window.addEventListener('resize', () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; resize(); });
+  });
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load('500 12px "JetBrains Mono"').then(resize, () => {});
+  }
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
